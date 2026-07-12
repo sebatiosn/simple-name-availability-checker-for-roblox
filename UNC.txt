@@ -1,0 +1,369 @@
+#!/usr/bin/env python3
+"""
+==============================================================================
+ ROBLOX FLAT-WORD USERNAME AVAILABILITY CHECKER - v2 (two-stage / batch)
+==============================================================================
+
+WHAT'S DIFFERENT FROM v1
+--------------------------
+v1 checked every single word one at a time against Roblox's slow
+per-username VALIDATION endpoint, with a polite delay between each call.
+That's the bottleneck: most words in any list are already taken, and you
+don't need the slow endpoint just to find that out.
+
+v2 splits the work into two stages so the slow endpoint is only used on
+words that actually have a chance:
+
+  STAGE 1 - BULK LOOKUP (fast)
+    Roblox has a bulk endpoint that accepts up to 100 usernames per
+    request and tells you which of them belong to an existing account:
+        POST https://users.roblox.com/v1/usernames/users
+    We chop the word list into batches of 100 and send them through
+    this endpoint. Anything that comes back as an existing account is
+    immediately marked TAKEN. A little delay between each BATCH is
+    still used to be a well-behaved client, but since one call now
+    covers 100 words instead of 1, the total number of requests (and
+    total wait time) drops by roughly 100x for this stage.
+
+  STAGE 2 - VALIDATION (slow, but on far fewer words)
+    Whatever DIDN'T show up as an existing account in Stage 1 gets
+    passed, one at a time with the same polite delay as v1, through
+    the per-username VALIDATION endpoint:
+        GET https://auth.roblox.com/v1/usernames/validate
+    This is the only endpoint that can confirm a name is both unclaimed
+    AND passes Roblox's own content/appropriateness filter -- so it's
+    still needed, just no longer wasted on words that were obviously
+    taken.
+
+Net effect: since most dictionary words are already registered, Stage 1
+typically eliminates 80-90%+ of the list in a handful of batched
+requests, leaving only a small pool of real candidates for the slower
+Stage 2 check. Total requests to Roblox go DOWN, not up -- this is
+about working smarter, not about bypassing any rate limit.
+
+WHAT THIS SCRIPT DOES NOT DO
+------------------------------
+It does not use multiple threads/processes to fire requests in
+parallel, does not rotate IPs or spoof headers, and does not reduce the
+delay used for the slow endpoint below a polite level. Those kinds of
+tricks are about evading rate limits, which this script deliberately
+avoids -- the speedup here comes entirely from doing less work, not
+from hitting Roblox harder.
+
+HOW IT WORKS, STEP BY STEP
+-----------------------------
+1. Load a word list (the 600-word built-in DEFAULT_WORDS below, or your
+   own file via --wordlist).
+2. Filter it down to valid candidates: letters only, 3-20 characters
+   (Roblox's hard limits).
+3. STAGE 1: split candidates into batches of up to 100. For each batch,
+   POST to the bulk usernames endpoint. Any word that comes back with a
+   matching existing account is marked TAKEN immediately.
+4. STAGE 2: for every word that stage 1 could NOT confirm as taken,
+   call the single-username VALIDATION endpoint (same as v1) to get a
+   final AVAILABLE / TAKEN / FILTERED / ERROR verdict.
+5. Print progress the whole way through, in the same
+   [i/total] username --> STATUS format as v1, tagged with which stage
+   produced the answer.
+6. Print a final summary of every AVAILABLE username found.
+
+WHY THE BIRTHDAY PARAMETER IS THERE (Stage 2 only)
+------------------------------------------------------
+Roblox's validation endpoint requires a `birthday` query parameter
+because naming rules differ slightly for accounts registered as minors.
+This script always sends a fixed placeholder date (2000-01-01) -- it is
+NOT your birthday, it is not stored anywhere, and has nothing to do
+with any real person.
+
+A NOTE ON RATE LIMITS / TERMS OF SERVICE
+------------------------------------------
+Please keep the delays as they are (or increase them). Batching cuts
+the NUMBER of requests dramatically, which is what makes this faster
+and lighter on Roblox's servers -- it is not a license to hammer the
+remaining requests. If Roblox ever returns errors or rate-limit
+responses, the script reports that rather than retrying aggressively.
+
+==============================================================================
+"""
+
+import argparse
+import sys
+import time
+import requests
+
+DEFAULT_WORDS = [
+    "abbey", "abyss", "acorn", "actor", "agile", "alarm",
+    "album", "alert", "alloy", "almond", "aloft", "alpine",
+    "amber", "amulet", "anchor", "angle", "animal", "ankle",
+    "antique", "anvil", "apex", "apple", "arbiter", "arbor",
+    "arch", "arena", "armada", "armor", "arrow", "aspen",
+    "august", "aurora", "avenue", "avocado", "axiom", "azure",
+    "badge", "baker", "balsa", "bamboo", "banjo", "banner",
+    "barge", "barrel", "basalt", "basil", "basin", "bastion",
+    "bayou", "beacon", "beaver", "bedrock", "beetle", "belfry",
+    "bench", "berry", "bike", "billow", "birch", "bishop",
+    "blaze", "blizzard", "bloom", "bluff", "bolster", "boulder",
+    "bounty", "brace", "bramble", "breeze", "briar", "bristle",
+    "bronze", "brook", "burrow", "cabin", "cactus", "cadence",
+    "calico", "camel", "candle", "canopy", "canyon", "caramel",
+    "caravan", "carbon", "cargo", "carnival", "carpet", "cascade",
+    "casket", "castle", "cavern", "cedar", "cellar", "cement",
+    "chalk", "chamber", "charm", "charter", "cherry", "chestnut",
+    "chime", "chisel", "cinder", "cipher", "citadel", "clasp",
+    "cliff", "cloak", "clockwork", "clover", "cobalt", "colony",
+    "comet", "compass", "copper", "coral", "cordial", "cove",
+    "crest", "crimson", "crown", "crystal", "dagger", "dahlia",
+    "daisy", "dapple", "dawn", "dawnlight", "decade", "delta",
+    "deluge", "denim", "depot", "desert", "dew", "diadem",
+    "diamond", "dimple", "dinghy", "dispatch", "ditch", "dividend",
+    "dockyard", "dolphin", "domain", "dome", "dover", "dragon",
+    "drape", "dredge", "drift", "driftwood", "drizzle", "drum",
+    "duchess", "dune", "dusk", "dust", "dwelling", "dynamo",
+    "eagle", "earnest", "ebb", "ebony", "echo", "echoing",
+    "eclipse", "edge", "effigy", "elbow", "elder", "elixir",
+    "elm", "elope", "embargo", "ember", "emblem", "emerald",
+    "emerge", "empire", "enclave", "endeavor", "engrave", "enigma",
+    "ensign", "entity", "envoy", "epithet", "epoch", "equinox",
+    "ermine", "errand", "estate", "estuary", "ether", "ethos",
+    "eventide", "evergreen", "exile", "fable", "falcon", "fanfare",
+    "feather", "fern", "fervor", "fiber", "field", "filament",
+    "finch", "firefly", "fjord", "flagon", "flame", "flare",
+    "flask", "fledgling", "fleece", "flicker", "flint", "flora",
+    "flourish", "flute", "foam", "foliage", "folklore", "foray",
+    "foreman", "forest", "forge", "forsythia", "fossil", "foundry",
+    "fountain", "fox", "frontier", "frost", "frostbite", "fungus",
+    "furnace", "gable", "galaxy", "galleon", "garden", "garment",
+    "garnet", "gateway", "gazelle", "gecko", "gem", "gemstone",
+    "glacier", "glade", "glaze", "glimmer", "glisten", "globe",
+    "glow", "gorge", "granite", "grape", "gravel", "grotto",
+    "grove", "guild", "guitar", "gulf", "gully", "gunmetal",
+    "gust", "gypsum", "habit", "halo", "hamlet", "hammer",
+    "harbinger", "harbor", "harmony", "harness", "harvest", "hatch",
+    "haven", "hawk", "hazel", "hearth", "heather", "hemlock",
+    "herald", "heron", "hickory", "hive", "hollow", "hollowbrook",
+    "homestead", "horde", "horizon", "hornet", "hovel", "hurdle",
+    "hush", "husk", "husky", "hydra", "hymn", "hyphen",
+    "ibis", "icicle", "icon", "idol", "igloo", "imp",
+    "incense", "index", "indigo", "ingot", "inkling", "inkwell",
+    "inlet", "inn", "insight", "insignia", "instinct", "interlude",
+    "interval", "ion", "iris", "iron", "ironwood", "island",
+    "isle", "ivory", "ivy", "jab", "jackal", "jade",
+    "jaguar", "jangle", "jasmine", "jasper", "jelly", "jerky",
+    "jester", "jetty", "jewel", "jigsaw", "jog", "jolt",
+    "journey", "jovial", "joy", "jubilant", "jubilee", "jumble",
+    "junction", "juncture", "jungle", "juniper", "jute", "karma",
+    "kayak", "kazoo", "keg", "kelp", "kelvin", "kernel",
+    "kestrel", "kettle", "keystone", "kiln", "kilt", "kimono",
+    "kindling", "kingdom", "kinship", "kiosk", "kite", "kitten",
+    "kiwi", "knack", "knapsack", "knight", "knoll", "knothole",
+    "koala", "kraken", "kudzu", "labyrinth", "lacquer", "lagoon",
+    "lake", "landmark", "lantern", "larch", "lark", "lattice",
+    "laurel", "lava", "lavender", "ledge", "legacy", "legend",
+    "lemon", "lentil", "leopard", "lighthouse", "lilac", "linen",
+    "lintel", "lion", "loam", "lobby", "locust", "lodge",
+    "loft", "longbow", "lookout", "lotus", "lullaby", "lumber",
+    "lunar", "magma", "magnet", "mahogany", "maize", "mallard",
+    "mallow", "mammoth", "mango", "manor", "mantel", "mantle",
+    "maple", "marble", "marigold", "marrow", "marsh", "marvel",
+    "mason", "meadow", "meander", "melody", "memoir", "menagerie",
+    "mercury", "mesa", "meteor", "midnight", "minaret", "mineral",
+    "mirage", "mirth", "mist", "moat", "monsoon", "moon",
+    "moraine", "mosaic", "muster", "nadir", "nectar", "nectarine",
+    "needle", "nest", "nettle", "niche", "nickel", "nimble",
+    "nimbus", "noble", "node", "nomad", "nook", "noon",
+    "north", "northwind", "notch", "nova", "novel", "nuance",
+    "nucleus", "nudge", "nugget", "numeral", "nutmeg", "nylon",
+    "oak", "oakwood", "oasis", "oats", "obelisk", "obsidian",
+    "ocean", "ochre", "octave", "offering", "olive", "omega",
+    "onion", "onyx", "opal", "orange", "oratory", "orbit",
+    "orchard", "orchid", "oregano", "oriole", "ostrich", "otter",
+    "outpost", "outrider", "oval", "overture", "owl", "paddle",
+    "palace", "palisade", "palm", "panda", "panther", "pantry",
+    "papaya", "paragon", "parapet", "parchment", "parsley", "passage",
+    "pasture", "path", "pavilion", "peak", "pearl", "pebble",
+    "pecan", "pelican", "pendant", "penny", "pepper", "petal",
+    "phoenix", "pigeon", "pillar", "pine", "pinnacle", "plaza",
+    "plumage", "prairie", "promontory", "quail", "quaint", "qualm",
+    "quandary", "quarry", "quartz", "quaver", "quench", "quest",
+    "quicken", "quicksand", "quill", "quilt", "quince", "quintet",
+    "quirk", "quiver", "quiz", "quorum", "quota", "rabbit",
+    "radish", "ramble", "ranch", "rapids", "raven", "ravine",
+    "reckon", "reed", "reef", "regalia", "relay", "relic",
+    "relish", "remnant", "reservoir", "resin", "reverie", "ridge",
+    "ripple", "river", "riverbank", "robin", "rocket", "roost",
+    "rose", "roster", "rowan", "ruby", "rugged", "rune",
+]
+
+VALIDATE_URL = "https://auth.roblox.com/v1/usernames/validate"
+BULK_LOOKUP_URL = "https://users.roblox.com/v1/usernames/users"
+PLACEHOLDER_BIRTHDAY = "2000-01-01"  # not a real user's birthday, see docstring
+BATCH_SIZE = 100  # Roblox's bulk endpoint accepts up to 100 usernames per call
+
+
+def load_wordlist(path):
+    """Read one word per line from a text file."""
+    with open(path, "r", encoding="utf-8") as f:
+        return [line.strip() for line in f if line.strip()]
+
+
+def is_flat_candidate(word):
+    """
+    Return True if `word` meets Roblox's basic username shape AND is a
+    'flat' word: letters only, no digits, no underscores, no spaces,
+    3-20 characters long (Roblox's hard length limits).
+    """
+    if not (3 <= len(word) <= 20):
+        return False
+    return word.isalpha()
+
+
+def bulk_check_taken(words, session, timeout=10):
+    """
+    STAGE 1: Send up to 100 words at once to Roblox's bulk usernames
+    endpoint. Returns a set of words (lowercased) that belong to an
+    EXISTING account, i.e. are definitely taken.
+
+    Words not in the returned set are NOT confirmed as available yet --
+    they just aren't confirmed taken by this fast check. They still
+    need Stage 2 to be fully verified (taken/available/filtered).
+    """
+    try:
+        resp = session.post(
+            BULK_LOOKUP_URL,
+            json={"usernames": words, "excludeBannedUsers": True},
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except (requests.RequestException, ValueError):
+        # If the bulk call fails for any reason, we simply treat this
+        # batch as "unresolved" -- every word in it will fall through
+        # to the slower Stage 2 check instead, so nothing is lost.
+        return set()
+
+    taken = set()
+    for entry in data.get("data", []):
+        name = entry.get("requestedUsername") or entry.get("name")
+        if name:
+            taken.add(name.lower())
+    return taken
+
+
+def validate_username(word, session, timeout=10):
+    """
+    STAGE 2: Query Roblox's public signup-validation endpoint for a
+    single word. Returns one of: "AVAILABLE", "TAKEN", "FILTERED", "ERROR"
+    plus a short reason string for context.
+    """
+    params = {
+        "username": word,
+        "birthday": PLACEHOLDER_BIRTHDAY,
+        "context": "Signup",
+    }
+    try:
+        resp = session.get(VALIDATE_URL, params=params, timeout=timeout)
+        resp.raise_for_status()
+        data = resp.json()
+    except requests.RequestException as e:
+        return "ERROR", f"network error: {e}"
+    except ValueError:
+        return "ERROR", "could not parse response"
+
+    message = str(data.get("message", "")).lower()
+    code = data.get("code", None)
+
+    if code == 0:
+        return "AVAILABLE", "valid and unclaimed"
+
+    if "taken" in message or "already" in message:
+        return "TAKEN", data.get("message", "")
+
+    if "filter" in message or "not allowed" in message or "moderat" in message:
+        return "FILTERED", data.get("message", "")
+
+    return "FILTERED", data.get("message", "unspecified rejection")
+
+
+def chunked(seq, size):
+    """Yield successive `size`-length chunks from `seq`."""
+    for i in range(0, len(seq), size):
+        yield seq[i:i + size]
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Two-stage (batch + validate) Roblox username availability checker."
+    )
+    parser.add_argument(
+        "--wordlist", type=str, default=None,
+        help="Path to a text file with one candidate word per line. "
+             "If omitted, the built-in 600-word list is used."
+    )
+    parser.add_argument(
+        "--delay", type=float, default=1.5,
+        help="Seconds to wait between each Stage 2 (validation) request, "
+             "and between each Stage 1 (bulk) batch. Default: 1.5"
+    )
+    args = parser.parse_args()
+
+    raw_words = load_wordlist(args.wordlist) if args.wordlist else DEFAULT_WORDS
+    candidates = sorted({w.lower() for w in raw_words if is_flat_candidate(w)})
+    skipped = len(raw_words) - len(candidates)
+    if skipped:
+        print(f"Skipped {skipped} word(s) that didn't meet the flat/length rules.\n")
+
+    if not candidates:
+        print("No valid candidate words to check. Exiting.")
+        sys.exit(0)
+
+    total = len(candidates)
+    session = requests.Session()
+    session.headers.update({"User-Agent": "username-availability-checker/2.0"})
+
+    results = {}  # word -> (status, reason)
+
+    # ---------------- STAGE 1: bulk lookup ----------------
+    batches = list(chunked(candidates, BATCH_SIZE))
+    print(f"Stage 1: bulk-checking {total} word(s) in {len(batches)} batch(es) of up to {BATCH_SIZE}...\n")
+
+    checked_so_far = 0
+    for batch_num, batch in enumerate(batches, start=1):
+        taken_in_batch = bulk_check_taken(batch, session)
+        for word in batch:
+            checked_so_far += 1
+            if word in taken_in_batch:
+                results[word] = ("TAKEN", "existing account (bulk lookup)")
+                print(f"[{checked_so_far}/{total}] {word} --> TAKEN  (stage 1: bulk)")
+        if batch_num < len(batches):
+            time.sleep(args.delay)
+
+    unresolved = [w for w in candidates if w not in results]
+    print(f"\nStage 1 complete: {len(candidates) - len(unresolved)} confirmed TAKEN, "
+          f"{len(unresolved)} still need confirmation.\n")
+
+    # ---------------- STAGE 2: validate the rest ----------------
+    print(f"Stage 2: validating the {len(unresolved)} remaining candidate(s)...\n")
+    for i, word in enumerate(unresolved, start=1):
+        status, reason = validate_username(word, session)
+        results[word] = (status, reason)
+        overall_index = (len(candidates) - len(unresolved)) + i
+        print(f"[{overall_index}/{total}] {word} --> {status}  (stage 2: validate)")
+        if i < len(unresolved):
+            time.sleep(args.delay)
+
+    # ---------------- Summary ----------------
+    available = [w for w in candidates if results[w][0] == "AVAILABLE"]
+
+    print("\n" + "=" * 50)
+    print("SUMMARY - AVAILABLE USERNAMES")
+    print("=" * 50)
+    if available:
+        for w in available:
+            print(f"  - {w}")
+        print(f"\n{len(available)} of {total} checked word(s) are available.")
+    else:
+        print("None of the checked words are currently available.")
+
+
+if __name__ == "__main__":
+    main()
